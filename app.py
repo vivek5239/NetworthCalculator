@@ -1029,27 +1029,27 @@ if not df.empty:
             ids_to_delete = [int(i) for i in rows_to_delete['id'].unique() if i != -1]
             print(f"IDs to delete: {ids_to_delete}")
             
-                        if ids_to_delete:
-                            try:
-                                # Fetch info for transaction cleanup
-                                to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
-            
-                                # Perform deletion
-                                del_count = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
-                                print(f"Deleted from DB: {del_count}")
-            
-                                # Delete Transactions
-                                for name, owner_name in to_del_info:
-                                    session.query(InvestmentTransaction).filter(
-                                        InvestmentTransaction.asset_name == name, 
-                                        InvestmentTransaction.owner == owner_name
-                                    ).delete(synchronize_session=False)
-                                    
-                                st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
-                            except Exception as e:
-                                session.rollback()
-                                print(f"ERROR deleting: {e}")
-                                st.error(f"Error deleting: {e}")
+            if ids_to_delete:
+                try:
+                    # Fetch info for transaction cleanup
+                    to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
+
+                    # Perform deletion
+                    del_count = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
+                    print(f"Deleted from DB: {del_count}")
+
+                    # Delete Transactions
+                    for name, owner_name in to_del_info:
+                        session.query(InvestmentTransaction).filter(
+                            InvestmentTransaction.asset_name == name, 
+                            InvestmentTransaction.owner == owner_name
+                        ).delete(synchronize_session=False)
+                        
+                    st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
+                except Exception as e:
+                    session.rollback()
+                    print(f"ERROR deleting: {e}")
+                    st.error(f"Error deleting: {e}")
             # 2. Handle Updates
             # Filter out deleted rows and total row
             rows_to_update = edited_df[(edited_df['Delete'] == False) & (edited_df['id'] != -1)]
