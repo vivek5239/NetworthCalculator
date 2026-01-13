@@ -1038,7 +1038,6 @@ if not df.empty:
 
             # Remove duplicates
             ids_to_delete = list(set(ids_to_delete))
-
             print(f"IDs to delete: {ids_to_delete}")
             
             if ids_to_delete:
