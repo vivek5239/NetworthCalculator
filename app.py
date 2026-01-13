@@ -329,16 +329,32 @@ def parse_and_load_json(json_content, owner_name, auto_fill_tickers=True):
         
         # 2. Fetch Existing State (Before Deletion) for History Calculation
         # Map by ISIN (primary) and Name (secondary fallback)
-        existing_assets_map = {}
-        existing_assets_by_name = {}
+        # We must AGGREGATE existing holdings because the DB might currently contain duplicates.
+        existing_assets_map = {}      # Key: ISIN, Value: {quantity, ticker}
+        existing_assets_by_name = {}  # Key: Name, Value: {quantity, ticker}
+        
+        # Helper to normalize names for matching
+        def normalize(n): return n.strip().lower() if n else ""
         
         current_db_assets = session.query(Asset).filter(Asset.owner == owner_name).all()
         for asset in current_db_assets:
+            # Aggregate by ISIN
             if asset.isin:
-                existing_assets_map[asset.isin] = asset
-            # Also map by name as fallback, normalizing spaces
-            norm_name = asset.name.strip().lower()
-            existing_assets_by_name[norm_name] = asset
+                if asset.isin not in existing_assets_map:
+                    existing_assets_map[asset.isin] = {'quantity': 0.0, 'ticker': asset.ticker}
+                existing_assets_map[asset.isin]['quantity'] += asset.quantity
+                # Keep the first non-null ticker found
+                if not existing_assets_map[asset.isin]['ticker'] and asset.ticker:
+                    existing_assets_map[asset.isin]['ticker'] = asset.ticker
+            
+            # Aggregate by Name (Fallback)
+            norm_name = normalize(asset.name)
+            if norm_name:
+                if norm_name not in existing_assets_by_name:
+                    existing_assets_by_name[norm_name] = {'quantity': 0.0, 'ticker': asset.ticker}
+                existing_assets_by_name[norm_name]['quantity'] += asset.quantity
+                if not existing_assets_by_name[norm_name]['ticker'] and asset.ticker:
+                     existing_assets_by_name[norm_name]['ticker'] = asset.ticker
 
         # 3. Snapshot Strategy: Delete existing assets for this owner
         # This prevents duplicates and ensures the portfolio matches the imported file exactly.
@@ -349,52 +365,96 @@ def parse_and_load_json(json_content, owner_name, auto_fill_tickers=True):
         added_count = 0
         transactions_logged = 0
         
-        # Helper to normalize names for matching
-        def normalize(n): return n.strip().lower() if n else ""
+        # --- PRE-PROCESS & AGGREGATE INPUT DATA ---
+        # We will collect all inputs into a dictionary first to handle multiple folios/entries
+        # Key: ISIN (preferred) or Normalized Name
+        # Value: Object with summed fields
+        aggregated_holdings = {} 
 
-        def process_asset(name, type_, qty, val, isin=None, dp_name=None):
-            nonlocal added_count, transactions_logged
-            
+        def add_to_aggregate(name, type_, qty, val, isin=None, dp_name=None):
             if qty <= 0: return
 
+            # Key Generation
+            key = isin if isin else normalize(name)
+            if not key: return # Skip invalid items
+
+            if key not in aggregated_holdings:
+                aggregated_holdings[key] = {
+                    'name': name,
+                    'type': type_,
+                    'quantity': 0.0,
+                    'value': 0.0,
+                    'isin': isin,
+                    'dp_name': dp_name, # Will keep the first one encountered
+                    'ticker': None # Will resolve later
+                }
+            
+            # Aggregate
+            aggregated_holdings[key]['quantity'] += qty
+            aggregated_holdings[key]['value'] += val
+            # Update name/dp if better one found? For now, stick to first or last.
+            # Maybe prefer name with more details? N/A for now.
+
+        # --- Traverse JSON Structure ---
+        if 'demat_accounts' in data:
+            for account in data['demat_accounts']:
+                dp = account.get('dp_name')
+                h = account.get('holdings', {})
+                for i in h.get('equities', []): add_to_aggregate(i.get('name'), 'Stock', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
+                for i in h.get('demat_mutual_funds', []): add_to_aggregate(i.get('name'), 'MF', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
+                for i in h.get('corporate_bonds', []): add_to_aggregate(i.get('name'), 'Bond', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
+                for i in h.get('government_securities', []): add_to_aggregate(i.get('name'), 'Govt Sec', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
+
+        if 'mutual_funds' in data:
+            for mf in data['mutual_funds']:
+                amc = mf.get('amc')
+                for s in mf.get('schemes', []):
+                    add_to_aggregate(s.get('name'), 'MF', float(s.get('units',0)), float(s.get('value',0)), s.get('isin'), dp_name=amc)
+        
+        # --- PROCESS AGGREGATED ITEMS ---
+        # Special MF Ticker map
+        ISIN_MAP_HARDCODED = {
+            "INE674K01013": "ABCAPITAL.NS",
+            "INE009A01021": "INFY.NS",
+            "INE467B01029": "TCS.NS",
+            "INE040A01034": "HDFCBANK.NS",
+            "INF204KB17I5": "GOLDBEES.NS",
+            "INF789F01XA0": "0P0000XVU2.BO",
+        }
+
+        for key, item in aggregated_holdings.items():
+            name = item['name']
+            type_ = item['type']
+            qty = item['quantity']
+            val = item['value']
+            isin = item['isin']
+            dp_name = item['dp_name']
+
             unit_price = val / qty if qty else 0
-            
-            # Special MF Ticker map
-            ISIN_MAP = {
-                "INE674K01013": "ABCAPITAL.NS",
-                "INE009A01021": "INFY.NS",
-                "INE467B01029": "TCS.NS",
-                "INE040A01034": "HDFCBANK.NS",
-                "INF204KB17I5": "GOLDBEES.NS",
-                "INF789F01XA0": "0P0000XVU2.BO",
-            }
-            
+
             # --- HISTORY TRACKING (Diff against Old State) ---
-            # Try to find the "Previous Version" of this asset
-            prev_asset = None
+            prev_qty = 0.0
+            prev_ticker = None
+            
+            # Lookup in aggregated existing state
             if isin and isin in existing_assets_map:
-                prev_asset = existing_assets_map[isin]
+                prev_qty = existing_assets_map[isin]['quantity']
+                prev_ticker = existing_assets_map[isin]['ticker']
             elif normalize(name) in existing_assets_by_name:
-                prev_asset = existing_assets_by_name[normalize(name)]
+                prev_qty = existing_assets_by_name[normalize(name)]['quantity']
+                prev_ticker = existing_assets_by_name[normalize(name)]['ticker']
             
             # Calculate Change
-            qty_diff = 0
-            if prev_asset:
-                qty_diff = qty - prev_asset.quantity
-            else:
-                qty_diff = qty # New asset, so all quantity is "new"
+            qty_diff = qty - prev_qty
             
             # Log Transaction if significant increase (BUY)
-            # We ignore small rounding diffs (< 0.001)
-            # We also ignore decreases (SELLs) for now unless you want to track them
             if qty_diff > 0.001:
-                # Use ticker from previous asset if available, else guess
-                hist_ticker = prev_asset.ticker if prev_asset and prev_asset.ticker else None
+                hist_ticker = prev_ticker
                 if not hist_ticker and auto_fill_tickers and type_ == 'Stock':
                      hist_ticker = guess_ticker(name, isin)
                 
-                if type_ == 'MF' and isin in ISIN_MAP:
-                    hist_ticker = ISIN_MAP[isin]
+                if type_ == 'MF' and isin in ISIN_MAP_HARDCODED:
+                    hist_ticker = ISIN_MAP_HARDCODED[isin]
 
                 invested_amt = qty_diff * unit_price
                 
@@ -411,15 +471,15 @@ def parse_and_load_json(json_content, owner_name, auto_fill_tickers=True):
                 session.add(trans)
                 transactions_logged += 1
 
-            # --- CREATE NEW ASSET (Replacement) ---
+            # --- CREATE NEW ASSET (Aggregated) ---
             ticker = None
-            if prev_asset and prev_asset.ticker:
-                 ticker = prev_asset.ticker # Preserve ticker from DB if it existed
+            if prev_ticker:
+                 ticker = prev_ticker # Preserve ticker from DB
             elif auto_fill_tickers and type_ == 'Stock':
                 ticker = guess_ticker(name, isin)
             
-            if type_ == 'MF' and isin in ISIN_MAP:
-                ticker = ISIN_MAP[isin]
+            if type_ == 'MF' and isin in ISIN_MAP_HARDCODED:
+                ticker = ISIN_MAP_HARDCODED[isin]
             
             new_asset = Asset(
                 owner=owner_name,
@@ -436,25 +496,10 @@ def parse_and_load_json(json_content, owner_name, auto_fill_tickers=True):
             session.add(new_asset)
             added_count += 1
 
-        if 'demat_accounts' in data:
-            for account in data['demat_accounts']:
-                dp = account.get('dp_name')
-                h = account.get('holdings', {})
-                for i in h.get('equities', []): process_asset(i.get('name'), 'Stock', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
-                for i in h.get('demat_mutual_funds', []): process_asset(i.get('name'), 'MF', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
-                for i in h.get('corporate_bonds', []): process_asset(i.get('name'), 'Bond', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
-                for i in h.get('government_securities', []): process_asset(i.get('name'), 'Govt Sec', float(i.get('units',0)), float(i.get('value',0)), i.get('isin'), dp_name=dp)
-
-        if 'mutual_funds' in data:
-            for mf in data['mutual_funds']:
-                amc = mf.get('amc')
-                for s in mf.get('schemes', []):
-                    process_asset(s.get('name'), 'MF', float(s.get('units',0)), float(s.get('value',0)), s.get('isin'), dp_name=amc)
-
         session.commit()
         session.close()
         st.cache_data.clear()
-        return True, f"Data processed! Added: {added_count}, Updated: {updated_count}, Transactions Logged: {transactions_logged}"
+        return True, f"Data processed! Assets (Aggregated): {added_count}, Transactions Logged: {transactions_logged}"
     except Exception as e:
         return False, str(e)
 
