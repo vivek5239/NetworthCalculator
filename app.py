@@ -1393,9 +1393,18 @@ if not df.empty:
             st.divider()
             st.subheader("Database Restore")
             
-            # List available backups
-            backups = [f for f in os.listdir(BASE_DIR) if f.startswith('finance.db.') and f.endswith('.bak')]
-            backups.sort(reverse=True) # Newest first
+            # Determine DB Directory and Filename
+            db_dir = os.path.dirname(DB_FILE)
+            db_filename = os.path.basename(DB_FILE)
+            
+            # List available backups in the DB directory
+            try:
+                # Filter for files that start with the DB filename (e.g. finance.db.2023...)
+                backups = [f for f in os.listdir(db_dir) if f.startswith(f"{db_filename}.") and f.endswith('.bak')]
+                backups.sort(reverse=True) # Newest first
+            except Exception as e:
+                st.error(f"Error reading backup directory: {e}")
+                backups = []
             
             if backups:
                 selected_backup = st.selectbox("Select Backup to Restore", ["Select..."] + backups)
@@ -1407,7 +1416,7 @@ if not df.empty:
                             st.info(f"Safety backup created: {pre_restore_bkp}")
                             
                             # 2. Perform Restore
-                            src = os.path.join(BASE_DIR, selected_backup)
+                            src = os.path.join(db_dir, selected_backup)
                             # Close session before overwriting DB file
                             session.close()
                             
