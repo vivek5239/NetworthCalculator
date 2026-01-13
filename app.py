@@ -949,6 +949,9 @@ if not df.empty:
         # Prepare display dataframe to avoid modifying the global 'df'
         display_df = df.copy()
 
+        # Add "Delete" column for explicit deletion
+        display_df.insert(0, "Delete", False)
+
         # Append TOTAL Row for display
         if not display_df.empty:
             total_val = display_df['Value (INR)'].sum()
@@ -960,11 +963,12 @@ if not df.empty:
             total_row['name'] = "💰 TOTAL"
             total_row['Value (INR)'] = total_val
             total_row['daily_total_value_change'] = total_diff
+            total_row['Delete'] = False
             
             # Use pd.concat to append
             display_df = pd.concat([display_df, pd.DataFrame([total_row])], ignore_index=True)
 
-        all_cols = ['id', 'owner', 'dp_name', 'name', 'isin', 'ticker', 'last_updated', 'asset_type', 'quantity', 'unit_price', 'daily_price_change', 'daily_total_value_change', 'Value (INR)', 'original_currency', 'original_unit_price', 'daily_change_pct', 'avg_buy_price']
+        all_cols = ['Delete', 'id', 'owner', 'dp_name', 'name', 'isin', 'ticker', 'last_updated', 'asset_type', 'quantity', 'unit_price', 'daily_price_change', 'daily_total_value_change', 'Value (INR)', 'original_currency', 'original_unit_price', 'daily_change_pct', 'avg_buy_price']
         
         # 1. Select visible columns
         selected_cols = st.multiselect("Select Columns to Show", all_cols, default=all_cols)
@@ -973,13 +977,14 @@ if not df.empty:
         st.write("Drag to Reorder:")
         sorted_cols = sort_items(selected_cols, direction="horizontal")
         
-        # Ensure 'id' is available for updates even if not selected for view
+        # Ensure 'id' and 'Delete' are available for updates even if not selected for view
         cols_to_use = sorted_cols.copy()
-        if 'id' not in cols_to_use:
-            cols_to_use.append('id')
+        if 'id' not in cols_to_use: cols_to_use.append('id')
+        if 'Delete' not in cols_to_use: cols_to_use.append('Delete')
 
         # Base config
         col_config = {
+            "Delete": st.column_config.CheckboxColumn(label="🗑️ Delete?", help="Check to delete this asset", width="small"),
             "id": st.column_config.NumberColumn(disabled=True, width="small"),
             "owner": st.column_config.TextColumn(label="Owner", disabled=True, width="medium"),
             "dp_name": st.column_config.TextColumn(label="DP/AMC", disabled=True, width="medium"),
@@ -1012,49 +1017,38 @@ if not df.empty:
         if st.button("Save Changes to Database"):
             session = SessionLocal()
             
-            # 1. Identify IDs to Delete
-            # Get IDs from the original dataframe (excluding the dummy TOTAL row with id=-1)
-            # Explicitly cast to native python int to avoid numpy/pandas type issues
-            original_ids = set(int(i) for i in display_df[display_df['id'] != -1]['id'].dropna().unique())
-            
-            # Get IDs from the edited dataframe
-            current_ids = set(int(i) for i in edited_df[edited_df['id'] != -1]['id'].dropna().unique())
-            
-            # Calculate IDs that were removed
-            ids_to_delete = list(original_ids - current_ids)
+            # 1. Handle Deletions (Explicit Checkbox)
+            rows_to_delete = edited_df[edited_df['Delete'] == True]
+            ids_to_delete = [int(i) for i in rows_to_delete['id'].unique() if i != -1]
             
             if ids_to_delete:
                 try:
-                    st.toast(f"Found {len(ids_to_delete)} items to delete...", icon="🗑️")
-                    
-                    # Fetch names and owners before deleting to clean up transactions
+                    # Fetch info for transaction cleanup
                     to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
                     
-                    # Perform deletion
-                    del_stmt = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
+                    # Delete Assets
+                    del_count = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
                     
-                    # Cleanup Transactions associated with these assets
+                    # Delete Transactions
                     for name, owner_name in to_del_info:
                         session.query(InvestmentTransaction).filter(
-                            InvestmentTransaction.asset_name == name,
+                            InvestmentTransaction.asset_name == name, 
                             InvestmentTransaction.owner == owner_name
                         ).delete(synchronize_session=False)
                         
-                    st.toast(f"Successfully deleted {del_stmt} assets.", icon="✅")
+                    st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
                 except Exception as e:
-                    st.error(f"Error deleting rows: {e}")
+                    st.error(f"Error deleting: {e}")
 
-            # 2. Perform Updates
-            for index, row in edited_df.iterrows():
-                if 'id' not in row: continue
-                # Skip the Total row or new rows without valid IDs if any
-                if row['id'] == -1 or pd.isna(row['id']): continue
+            # 2. Handle Updates
+            # Filter out deleted rows and total row
+            rows_to_update = edited_df[(edited_df['Delete'] == False) & (edited_df['id'] != -1)]
+            
+            for index, row in rows_to_update.iterrows():
+                if pd.isna(row['id']): continue
                 
                 asset = session.query(Asset).filter(Asset.id == row['id']).first()
                 if asset:
-                    # Update fields if changed
-                    # We check if keys exist in row because data_editor might not return hidden columns if config is weird,
-                    # but usually it returns what's passed.
                     if 'ticker' in row: asset.ticker = row['ticker']
                     if 'quantity' in row: asset.quantity = row['quantity']
                     if 'unit_price' in row: asset.unit_price = row['unit_price']
