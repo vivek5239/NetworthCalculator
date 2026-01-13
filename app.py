@@ -1025,9 +1025,20 @@ if not df.empty:
             
             if ids_to_delete:
                 try:
+                    # Fetch names and owners before deleting to clean up transactions
+                    to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
+                    
                     # Perform deletion
                     session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
-                    st.toast(f"Deleted {len(ids_to_delete)} assets.")
+                    
+                    # Cleanup Transactions associated with these assets
+                    for name, owner_name in to_del_info:
+                        session.query(InvestmentTransaction).filter(
+                            InvestmentTransaction.asset_name == name,
+                            InvestmentTransaction.owner == owner_name
+                        ).delete(synchronize_session=False)
+                        
+                    st.toast(f"Deleted {len(ids_to_delete)} assets and their transaction history.")
                 except Exception as e:
                     st.error(f"Error deleting rows: {e}")
 
