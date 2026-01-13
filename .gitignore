@@ -14,24 +14,17 @@ ENV/
 # Database
 *.db
 *.sqlite3
+*.bak
 
 # Logs
 *.log
 app_log.txt
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-
-# Project specific
-finance.db.20260112_210934.bak
-DEC2025_AA50698385_TXN.pdf
-casparser.png
-ukport.jpg
-parsed_cdsl.json
-data.json.txt
+# Data and sensitive files
+*.json
+*.pdf
+*.png
+*.jpg
+*.jpeg
 session_history.md
+data.json.txt
