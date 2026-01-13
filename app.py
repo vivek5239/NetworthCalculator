@@ -1011,6 +1011,27 @@ if not df.empty:
 
         if st.button("Save Changes to Database"):
             session = SessionLocal()
+            
+            # 1. Identify IDs to Delete
+            # Get IDs from the original dataframe (excluding the dummy TOTAL row with id=-1)
+            original_ids = set(display_df[display_df['id'] != -1]['id'].unique())
+            
+            # Get IDs from the edited dataframe
+            # Note: edited_df might contain new rows without IDs (if enabled), but we focus on deletions here
+            current_ids = set(edited_df[edited_df['id'] != -1]['id'].unique())
+            
+            # Calculate IDs that were removed
+            ids_to_delete = original_ids - current_ids
+            
+            if ids_to_delete:
+                try:
+                    # Perform deletion
+                    session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
+                    st.toast(f"Deleted {len(ids_to_delete)} assets.")
+                except Exception as e:
+                    st.error(f"Error deleting rows: {e}")
+
+            # 2. Perform Updates
             for index, row in edited_df.iterrows():
                 if 'id' not in row: continue
                 # Skip the Total row or new rows without valid IDs if any
@@ -1018,10 +1039,14 @@ if not df.empty:
                 
                 asset = session.query(Asset).filter(Asset.id == row['id']).first()
                 if asset:
+                    # Update fields if changed
+                    # We check if keys exist in row because data_editor might not return hidden columns if config is weird,
+                    # but usually it returns what's passed.
                     if 'ticker' in row: asset.ticker = row['ticker']
                     if 'quantity' in row: asset.quantity = row['quantity']
                     if 'unit_price' in row: asset.unit_price = row['unit_price']
                     if 'avg_buy_price' in row: asset.avg_buy_price = row['avg_buy_price']
+            
             session.commit()
             session.close()
             st.success("Saved!")
