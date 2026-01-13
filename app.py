@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import sqlalchemy
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import plotly.express as px
 import time
@@ -1017,29 +1017,39 @@ if not df.empty:
         if st.button("Save Changes to Database"):
             session = SessionLocal()
             
-            # 1. Handle Deletions (Explicit Checkbox)
-            rows_to_delete = edited_df[edited_df['Delete'] == True]
-            ids_to_delete = [int(i) for i in rows_to_delete['id'].unique() if i != -1]
+            # DEBUG
+            print("--- SAVE STARTED ---")
+            print("Columns:", edited_df.columns)
             
-            if ids_to_delete:
-                try:
-                    # Fetch info for transaction cleanup
-                    to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
-                    
-                    # Delete Assets
-                    del_count = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
-                    
-                    # Delete Transactions
-                    for name, owner_name in to_del_info:
-                        session.query(InvestmentTransaction).filter(
-                            InvestmentTransaction.asset_name == name, 
-                            InvestmentTransaction.owner == owner_name
-                        ).delete(synchronize_session=False)
-                        
-                    st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
-                except Exception as e:
-                    st.error(f"Error deleting: {e}")
-
+            # 1. Handle Deletions (Explicit Checkbox)
+            # Ensure we are looking at a boolean True, handling potential type oddities
+            rows_to_delete = edited_df[edited_df['Delete'] == True]
+            print(f"Rows marked for delete: {len(rows_to_delete)}")
+            
+            ids_to_delete = [int(i) for i in rows_to_delete['id'].unique() if i != -1]
+            print(f"IDs to delete: {ids_to_delete}")
+            
+                        if ids_to_delete:
+                            try:
+                                # Fetch info for transaction cleanup
+                                to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
+            
+                                # Perform deletion
+                                del_count = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
+                                print(f"Deleted from DB: {del_count}")
+            
+                                # Delete Transactions
+                                for name, owner_name in to_del_info:
+                                    session.query(InvestmentTransaction).filter(
+                                        InvestmentTransaction.asset_name == name, 
+                                        InvestmentTransaction.owner == owner_name
+                                    ).delete(synchronize_session=False)
+                                    
+                                st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
+                            except Exception as e:
+                                session.rollback()
+                                print(f"ERROR deleting: {e}")
+                                st.error(f"Error deleting: {e}")
             # 2. Handle Updates
             # Filter out deleted rows and total row
             rows_to_update = edited_df[(edited_df['Delete'] == False) & (edited_df['id'] != -1)]
