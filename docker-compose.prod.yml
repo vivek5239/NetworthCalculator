@@ -1,0 +1,70 @@
+services:
+  finance-app:
+    image: ${DOCKER_IMAGE_NAME:-finance-app:latest}
+    container_name: finance_app
+    # Ports are commented out to prevent direct public access. 
+    # Enable them only if you need to access via IP:PORT directly.
+    # ports:
+    #   - "8502:8502"
+    volumes:
+      - ${DOCKERDIR}/appdata/finance:/data
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DB_FILE_PATH=/data/finance.db
+    networks:
+      - t3_proxy
+    restart: unless-stopped
+    command: streamlit run app.py --server.port 8502 --server.address 0.0.0.0 --server.enableCORS false --server.enableXsrfProtection false
+
+  finance-api:
+    image: ${DOCKER_IMAGE_NAME:-finance-app:latest}
+    container_name: finance_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${DOCKERDIR}/appdata/finance:/data
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DB_FILE_PATH=/data/finance.db
+    networks:
+      - t3_proxy
+    restart: unless-stopped
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+
+  scheduler:
+    image: ${DOCKER_IMAGE_NAME:-finance-app:latest}
+    container_name: finance_scheduler
+    volumes:
+      - ${DOCKERDIR}/appdata/finance:/data
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DB_FILE_PATH=/data/finance.db
+    networks:
+      - t3_proxy
+    restart: unless-stopped
+    command: python scheduler.py
+
+  background-updater:
+    image: ${DOCKER_IMAGE_NAME:-finance-app:latest}
+    container_name: background_updater
+    volumes:
+      - ${DOCKERDIR}/appdata/finance:/data
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - DB_FILE_PATH=/data/finance.db
+    networks:
+      - t3_proxy
+    restart: unless-stopped
+    command: python background_updater.py
+
+networks:
+  t3_proxy:
+    external: true

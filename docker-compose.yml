@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  finance-app:
+    build: .
+    container_name: finance_app
+    ports:
+      - "8502:8502"
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+    command: streamlit run app.py --server.port 8502 --server.address 0.0.0.0 --server.enableCORS false --server.enableXsrfProtection false
+
+  finance-api:
+    build: .
+    container_name: finance_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+
+  scheduler:
+    build: .
+    container_name: finance_scheduler
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+    command: python scheduler.py
+
+  background-updater:
+    build: .
+    container_name: background_updater
+    volumes:
+      - .:/app
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+    command: python background_updater.py
