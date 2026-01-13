@@ -1049,6 +1049,7 @@ if not df.empty:
             
             session.commit()
             session.close()
+            st.cache_data.clear()
             st.success("Saved!")
             st.rerun()
 
