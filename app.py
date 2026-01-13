@@ -1019,14 +1019,26 @@ if not df.empty:
             
             # DEBUG
             print("--- SAVE STARTED ---")
-            print("Columns:", edited_df.columns)
-            
+            st.write("Processing changes...") # UI Feedback
+
             # 1. Handle Deletions (Explicit Checkbox)
-            # Ensure we are looking at a boolean True, handling potential type oddities
             rows_to_delete = edited_df[edited_df['Delete'] == True]
-            print(f"Rows marked for delete: {len(rows_to_delete)}")
-            
             ids_to_delete = [int(i) for i in rows_to_delete['id'].unique() if i != -1]
+            
+            # 2. Handle Native Deletions (Rows removed via Trash Icon)
+            # Find IDs that were in original 'display_df' but are missing from 'edited_df'
+            original_ids = set(display_df['id'].unique())
+            current_ids = set(edited_df['id'].unique())
+            missing_ids = original_ids - current_ids
+            
+            # Add missing IDs to delete list (excluding the Total row if it happened to be removed)
+            for mid in missing_ids:
+                if mid != -1:
+                    ids_to_delete.append(int(mid))
+
+            # Remove duplicates
+            ids_to_delete = list(set(ids_to_delete))
+
             print(f"IDs to delete: {ids_to_delete}")
             
             if ids_to_delete:
@@ -1046,12 +1058,15 @@ if not df.empty:
                         ).delete(synchronize_session=False)
                         
                     st.toast(f"Deleted {del_count} assets and associated transactions.", icon="🗑️")
+                    st.success(f"Deleted {del_count} assets.")
                 except Exception as e:
                     session.rollback()
                     print(f"ERROR deleting: {e}")
                     st.error(f"Error deleting: {e}")
-            # 2. Handle Updates
+            
+            # 3. Handle Updates
             # Filter out deleted rows and total row
+            # If using native delete, 'rows_to_update' naturally excludes them.
             rows_to_update = edited_df[(edited_df['Delete'] == False) & (edited_df['id'] != -1)]
             
             for index, row in rows_to_update.iterrows():
@@ -1067,7 +1082,8 @@ if not df.empty:
             session.commit()
             session.close()
             st.cache_data.clear()
-            st.success("Saved!")
+            st.success("Changes Saved!")
+            time.sleep(1) # Give user time to see success message
             st.rerun()
 
     with tab3:
