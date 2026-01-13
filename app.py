@@ -1014,22 +1014,24 @@ if not df.empty:
             
             # 1. Identify IDs to Delete
             # Get IDs from the original dataframe (excluding the dummy TOTAL row with id=-1)
-            original_ids = set(display_df[display_df['id'] != -1]['id'].unique())
+            # Explicitly cast to native python int to avoid numpy/pandas type issues
+            original_ids = set(int(i) for i in display_df[display_df['id'] != -1]['id'].dropna().unique())
             
             # Get IDs from the edited dataframe
-            # Note: edited_df might contain new rows without IDs (if enabled), but we focus on deletions here
-            current_ids = set(edited_df[edited_df['id'] != -1]['id'].unique())
+            current_ids = set(int(i) for i in edited_df[edited_df['id'] != -1]['id'].dropna().unique())
             
             # Calculate IDs that were removed
-            ids_to_delete = original_ids - current_ids
+            ids_to_delete = list(original_ids - current_ids)
             
             if ids_to_delete:
                 try:
+                    st.toast(f"Found {len(ids_to_delete)} items to delete...", icon="🗑️")
+                    
                     # Fetch names and owners before deleting to clean up transactions
                     to_del_info = session.query(Asset.name, Asset.owner).filter(Asset.id.in_(ids_to_delete)).all()
                     
                     # Perform deletion
-                    session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
+                    del_stmt = session.query(Asset).filter(Asset.id.in_(ids_to_delete)).delete(synchronize_session=False)
                     
                     # Cleanup Transactions associated with these assets
                     for name, owner_name in to_del_info:
@@ -1038,7 +1040,7 @@ if not df.empty:
                             InvestmentTransaction.owner == owner_name
                         ).delete(synchronize_session=False)
                         
-                    st.toast(f"Deleted {len(ids_to_delete)} assets and their transaction history.")
+                    st.toast(f"Successfully deleted {del_stmt} assets.", icon="✅")
                 except Exception as e:
                     st.error(f"Error deleting rows: {e}")
 
