@@ -95,6 +95,15 @@ class InvestmentTransaction(Base):
     total_amount = Column(Float, nullable=False)
     owner = Column(String, default="Vivek")
 
+class PortfolioChangeHistory(Base):
+    __tablename__ = 'portfolio_change_history'
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False, unique=True)
+    daily_change_value = Column(Float, nullable=True)
+    daily_change_percent = Column(Float, nullable=True)
+    monthly_change_value = Column(Float, nullable=True)
+    monthly_change_percent = Column(Float, nullable=True)
+
 # Increase timeout to 30s to handle concurrent writes (background updater + app)
 engine = create_engine(DATABASE_URL, connect_args={'timeout': 30})
 
@@ -170,8 +179,18 @@ def init_db():
         session.execute(sqlalchemy.text("SELECT * FROM investment_transactions LIMIT 1"))
     except Exception:
         try:
-            Base.metadata.create_all(bind=engine)
+            Base.metadata.create_all(bind=engine) # Re-run create_all to be sure
         except: pass
+        
+    # Migration: PortfolioChangeHistory table
+    try:
+        session.execute(sqlalchemy.text("SELECT * FROM portfolio_change_history LIMIT 1"))
+    except Exception:
+        try:
+            # Explicitly create the single table if it's missing
+            PortfolioChangeHistory.__table__.create(bind=engine, checkfirst=True)
+        except Exception as e_create:
+            print(f"Error creating portfolio_change_history table: {e_create}")
 
     session.close()
 
@@ -1207,18 +1226,9 @@ if not df.empty:
                     
                     # Base value 30 days ago for % calc
                     # Theoretical Base = Current Value - Gain
-                    # But if we only sum valid ones, we should use total_net_worth for context? 
-                    # Standard: (Gain / (Total - Gain)) * 100
                     base_val_month = current_val - monthly_market_change
                     if base_val_month != 0:
                         month_pct = (monthly_market_change / base_val_month) * 100
-                else:
-                    # Fallback if no 30d history (e.g. just reset): use Daily Change as proxy
-                    monthly_market_change = daily_change
-                    month_pct = daily_pct
-            else:
-                monthly_market_change = daily_change
-                month_pct = daily_pct
             
             # 3. Total Growth (Since Buy - Market P&L)
             # Calculate sum of (Current - AvgBuy) * Qty

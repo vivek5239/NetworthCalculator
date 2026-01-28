@@ -8,9 +8,10 @@ import logging
 import os
 import requests
 from groq import Groq
+import sys
+import argparse
 
 # --- Configuration ---
-# Use absolute path to ensure reliability
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.getenv('DB_FILE_PATH', os.path.join(BASE_DIR, 'finance.db'))
 DATABASE_URL = f"sqlite:///{DB_FILE}"
@@ -36,22 +37,31 @@ class Asset(Base):
     original_unit_price = Column(Float, nullable=True)
     original_currency = Column(String, nullable=True)
     price_30d = Column(Float, nullable=True)
+    avg_buy_price = Column(Float, nullable=True) # Added to match app.py
 
 class AppSettings(Base):
     __tablename__ = 'app_settings'
     id = Column(Integer, primary_key=True)
-    # Adding only necessary columns for this script
     groq_api_key = Column(String, nullable=True)
     gotify_url = Column(String, nullable=True)
     gotify_token = Column(String, nullable=True)
     gotify_enabled = Column(Boolean, default=False)
     ai_context_columns = Column(String, default="name,ticker,quantity,unit_price,Value (INR),daily_change_pct")
 
+class PortfolioChangeHistory(Base):
+    __tablename__ = 'portfolio_change_history'
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False, unique=True)
+    daily_change_value = Column(Float, nullable=True)
+    daily_change_percent = Column(Float, nullable=True)
+    monthly_change_value = Column(Float, nullable=True)
+    monthly_change_percent = Column(Float, nullable=True)
+
 engine = create_engine(DATABASE_URL, connect_args={'timeout': 30})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # --- Helpers ---
-
+# ... (Keep existing helpers: get_settings, send_gotify_alert, analyze_and_notify, etc.)
 # Global cache to prevent duplicate notifications
 last_sent_summary = None
 
@@ -97,57 +107,33 @@ def analyze_and_notify(session, assets):
         val = a.quantity * a.unit_price
         total_val += val
         if a.daily_change_pct is not None:
-            # Change in value = Value * (Pct / 100) / (1 + Pct/100) approx, 
-            # or more simply: PrevVal = Val / (1 + pct/100). Change = Val - PrevVal.
             prev_val = val / (1 + (a.daily_change_pct / 100))
             total_change_val += (val - prev_val)
             
     total_change_pct = (total_change_val / (total_val - total_change_val)) * 100 if (total_val - total_change_val) > 0 else 0.0
     
     print(f"Total Portfolio Change: {total_change_pct:.2f}%")
-
-    # Threshold for "Big Difference"
-    THRESHOLD = 0.5 # 0.5% move
+    THRESHOLD = 0.5
     
     if abs(total_change_pct) < THRESHOLD:
-        print(f"Skipping notification: Portfolio move {total_change_pct:.2f}% is below threshold {THRESHOLD}%")
-        # However, if individual stocks moved A LOT, we might still want to notify.
-        # Let's keep the old logic for significant movers too.
         significant_movers = [a for a in assets if a.daily_change_pct is not None and abs(a.daily_change_pct) > 2.0]
         if not significant_movers:
              return
-
-    # ... Proceed with AI Summary ...
     
     sorted_assets = sorted([a for a in assets if a.daily_change_pct is not None], key=lambda x: x.daily_change_pct, reverse=True)
     top_gainers = sorted_assets[:5]
     top_losers = sorted_assets[-5:]
     
-    # Context Construction
     context_lines = [f"Total Portfolio Change: {total_change_pct:+.2f}%"]
     context_lines.append("Asset | Price | Change %")
     for a in top_gainers:
         context_lines.append(f"{a.name} ({a.ticker}) | {a.unit_price:.2f} | +{a.daily_change_pct:.2f}%")
-    for a in top_losers: # handle overlap if list is short
+    for a in top_losers:
         if a not in top_gainers:
             context_lines.append(f"{a.name} ({a.ticker}) | {a.unit_price:.2f} | {a.daily_change_pct:.2f}%")
             
-    # Add a few high value assets for context regardless of move
-    # (Simplified logic: just use movers for now to fit user request for "fluctuations")
-    
     data_str = "\n".join(context_lines)
-    
-    prompt = f"""
-    Analyze these stock price movements (Top Gainers/Losers for the portfolio):
-    
-    {data_str}
-    
-    Task:
-    1. Identify any unusual or significant fluctuations.
-    2. Write a concise, 2-3 sentence summary suitable for a push notification.
-    3. If everything is relatively flat (e.g. < 1%), just say "Market is quiet."
-    4. Do not start with "Here is the summary". Just give the summary.
-    """
+    prompt = f"Analyze these stock price movements:\n\n{data_str}\n\nTask:\n1. Identify significant fluctuations.\n2. Write a concise, 2-3 sentence summary for a push notification.\n3. If flat, say 'Market is quiet.'\n4. Give only the summary."
     
     try:
         client = Groq(api_key=settings.groq_api_key)
@@ -159,161 +145,141 @@ def analyze_and_notify(session, assets):
         )
         summary = completion.choices[0].message.content.strip()
         
-        # --- SPAM PREVENTION CHECK ---
         if summary == last_sent_summary:
-            print("Skipping notification: Summary is identical to last sent.")
+            print("Skipping notification: Summary is identical.")
             return
             
-        # Send Notification
-        send_gotify_alert("📉 Market Update (30m)", summary, settings)
+        send_gotify_alert("📉 Market Update", summary, settings)
         print(f"Sent AI Notification: {summary}")
-        
-        # Update cache
         last_sent_summary = summary
-        
     except Exception as e:
         print(f"AI Analysis Failed: {e}")
 
-def find_ticker_with_ai(session, asset, settings):
-    """
-    Asks Groq to find the correct Yahoo Finance ticker.
-    Returns new ticker string or None.
-    """
-    if not settings or not settings.groq_api_key:
-        return None
-        
-    print(f"🤖 AI Fetching Ticker for: {asset.name} (ISIN: {asset.isin})")
-    
-    prompt = f"""
-    The stock asset "{asset.name}" (ISIN: {asset.isin}) failed to load with ticker "{asset.ticker}".
-    Please provide the CORRECT Yahoo Finance ticker symbol for this asset.
-    - It is likely an Indian stock (.NS or .BO suffix) or Mutual Fund.
-    - If it is a Tata Motors DVR, use 'TATAMTRDVR.NS' or 'TATAMOTORS-DVR.NS'.
-    - Return ONLY the ticker symbol (e.g., RELIANCE.NS). Do not write sentences.
-    """
-    
-    try:
-        client = Groq(api_key=settings.groq_api_key)
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=20
-        )
-        new_ticker = completion.choices[0].message.content.strip()
-        
-        # Basic validation: must look like a ticker (uppercase, no spaces usually)
-        # Yahoo tickers can be "ABC.NS"
-        if " " not in new_ticker and len(new_ticker) > 2:
-            # Check if different
-            if new_ticker != asset.ticker:
-                print(f"✨ AI Suggested Correction: {asset.ticker} -> {new_ticker}")
-                return new_ticker
-    except Exception as e:
-        print(f"AI Ticker Search Failed: {e}")
-        
-    return None
-
-def resolve_ticker_from_yahoo(query):
-    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            quotes = data.get('quotes', [])
-            if not quotes: return None
-            for q in quotes:
-                symbol = q.get('symbol', '')
-                if symbol.endswith('.NS') or symbol.endswith('.BO'):
-                    return symbol
-            return quotes[0].get('symbol')
-    except Exception:
-        return None
-    return None
-
 def get_exchange_rate(from_currency):
-    """
-    Fetches exchange rate to INR.
-    """
-    if from_currency == 'INR':
-        return 1.0
-    
-    # Handle pence
+    if from_currency == 'INR': return 1.0
     if from_currency == 'GBp':
-        # 100 GBp = 1 GBP.
-        # Get GBPINR rate and divide by 100 later, or just return rate for 1 GBp
-        # Yahoo symbol for GBP is GBPINR=X
         try:
-            ticker = yf.Ticker("GBPINR=X")
-            hist = ticker.history(period="1d")
-            if not hist.empty:
-                return hist['Close'].iloc[-1]
-        except:
-            pass
-        return 1.0 # Fallback
-
+            return yf.Ticker("GBPINR=X").history(period="1d")['Close'].iloc[-1]
+        except: return 1.0
     try:
-        # Standard pairs: USDINR=X, EURINR=X
-        symbol = f"{from_currency}INR=X"
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return hist['Close'].iloc[-1]
-    except:
-        print(f"Could not fetch rate for {from_currency}")
-    
-    return 1.0
-
-import sys
-import argparse
-
-# ... existing imports ...
+        return yf.Ticker(f"{from_currency}INR=X").history(period="1d")['Close'].iloc[-1]
+    except: return 1.0
 
 # --- Update Logic ---
 def update_prices():
     print(f"[{datetime.datetime.now()}] Starting Price Update...")
     session = SessionLocal()
-    settings = get_settings(session)
     
     try:
-        # Fetch assets with ticker OR isin
-        assets = session.query(Asset).filter((Asset.ticker.isnot(None)) | (Asset.isin.isnot(None))).all()
+        assets = session.query(Asset).filter(Asset.ticker.isnot(None)).all()
         updated_count = 0
-        updated_assets = []
-        ai_correction_count = 0
-        MAX_AI_CORRECTIONS = 3 
+        updated_assets_for_ai = []
         
-        # Calculate Total Portfolio Value BEFORE updates (using stale prices)
-        # Actually, better to compare Daily Change % of the Total Portfolio after update.
+        rates_cache = { 'INR': 1.0, 'USD': get_exchange_rate('USD'), 'GBP': get_exchange_rate('GBP'), 'EUR': get_exchange_rate('EUR') }
+
+        for asset in assets:
+            if not asset.ticker or not asset.ticker.strip(): continue
+            try:
+                ticker = yf.Ticker(asset.ticker)
+                # Fetch 35 days of history to ensure we get a valid 30-day prior price
+                hist = ticker.history(period="35d")
+                if hist.empty: continue
+                
+                today_price = hist['Close'].iloc[-1]
+                prev_close_price = hist['Close'].iloc[-2] if len(hist) >= 2 else today_price
+
+                # Find price from 30 days ago
+                price_30d = None
+                target_date = datetime.date.today() - datetime.timedelta(days=30)
+                # Find the closest available date in history
+                closest_date = min(hist.index, key=lambda d: abs(d.date() - target_date))
+                price_30d = hist.loc[closest_date]['Close']
+
+                currency = ticker.info.get('currency', 'INR')
+                
+                # --- Currency Conversion ---
+                native_price = today_price
+                price_inr = native_price
+                
+                if currency == 'GBp':
+                    price_inr = (native_price / 100) * rates_cache.get('GBP', 1.0)
+                elif currency != 'INR':
+                    price_inr = native_price * rates_cache.get(currency, 1.0)
+
+                asset.unit_price = price_inr
+                asset.original_unit_price = native_price
+                asset.original_currency = currency
+                asset.last_updated = datetime.datetime.now()
+                asset.price_30d = price_30d
+                
+                if prev_close_price > 0:
+                    asset.daily_change_pct = ((today_price - prev_close_price) / prev_close_price) * 100
+                
+                updated_assets_for_ai.append(asset)
+                updated_count += 1
+            except Exception as e:
+                print(f"Error updating {asset.ticker}: {e}")
+
+        # --- Calculate & Store Portfolio Changes ---
+        total_value = 0
+        total_daily_change_value = 0
+        total_monthly_change_value = 0
+        total_value_30d_ago = 0
         
-        # ... (rest of the fetching logic) ...
+        all_updated_assets = session.query(Asset).all() # Re-fetch all assets to get a complete picture
+        for asset in all_updated_assets:
+            current_val = asset.quantity * asset.unit_price
+            total_value += current_val
+
+            if asset.daily_change_pct is not None:
+                prev_price = asset.unit_price / (1 + (asset.daily_change_pct / 100))
+                total_daily_change_value += (asset.unit_price - prev_price) * asset.quantity
+            
+            if asset.price_30d is not None and asset.price_30d > 0:
+                total_monthly_change_value += (asset.unit_price - asset.price_30d) * asset.quantity
+                total_value_30d_ago += asset.price_30d * asset.quantity
+
+        yesterday_total_value = total_value - total_daily_change_value
+        daily_pct = (total_daily_change_value / yesterday_total_value) * 100 if yesterday_total_value else 0
+        monthly_pct = (total_monthly_change_value / total_value_30d_ago) * 100 if total_value_30d_ago else 0
+
+        # Upsert into history table
+        today = datetime.date.today()
+        change_record = session.query(PortfolioChangeHistory).filter_by(date=today).first()
+        if change_record:
+            change_record.daily_change_value = total_daily_change_value
+            change_record.daily_change_percent = daily_pct
+            change_record.monthly_change_value = total_monthly_change_value
+            change_record.monthly_change_percent = monthly_pct
+        else:
+            change_record = PortfolioChangeHistory(
+                date=today,
+                daily_change_value=total_daily_change_value,
+                daily_change_percent=daily_pct,
+                monthly_change_value=total_monthly_change_value,
+                monthly_change_percent=monthly_pct
+            )
+            session.add(change_record)
         
-        # AFTER loop:
-        # Calculate weighted average change or total value change?
-        # The individual assets have daily_change_pct updated.
-        
+        print(f"[{datetime.datetime.now()}] Logged portfolio changes for {today}.")
+
         session.commit()
         print(f"Updated {updated_count} assets.")
         
-        # Trigger AI Analysis
         if updated_count > 0:
-            analyze_and_notify(session, updated_assets)
+            settings = get_settings(session)
+            analyze_and_notify(session, updated_assets_for_ai)
             
     except Exception as e:
         print(f"Update Loop Error: {e}")
+        session.rollback()
     finally:
         session.close()
 
 def main_loop():
-    print("Background Price Updater Started.")
-    print("Schedule: Every 60 minutes.")
-    
-    # Run once immediately on start
-    update_prices()
-    
+    print("Background Price Updater Started. Schedule: Every 60 minutes.")
+    update_prices() # Run once on start
     while True:
-        # Sleep for 60 minutes
         time.sleep(3600)
         update_prices()
 
