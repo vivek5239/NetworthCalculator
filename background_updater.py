@@ -47,6 +47,7 @@ class AppSettings(Base):
     gotify_token = Column(String, nullable=True)
     gotify_enabled = Column(Boolean, default=False)
     ai_context_columns = Column(String, default="name,ticker,quantity,unit_price,Value (INR),daily_change_pct")
+    notification_threshold = Column(Float, default=5.0)
 
 class PortfolioChangeHistory(Base):
     __tablename__ = 'portfolio_change_history'
@@ -61,9 +62,10 @@ engine = create_engine(DATABASE_URL, connect_args={'timeout': 30})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # --- Helpers ---
-# ... (Keep existing helpers: get_settings, send_gotify_alert, analyze_and_notify, etc.)
 # Global cache to prevent duplicate notifications
-last_sent_summary = None
+# Format: { 'TICKER': last_notified_percentage }
+last_notified_prices = {} 
+last_total_change = None
 
 def get_settings(session):
     return session.query(AppSettings).filter(AppSettings.id == 1).first()
@@ -91,15 +93,16 @@ def send_gotify_alert(title, message, settings):
 def analyze_and_notify(session, assets):
     """
     Uses Groq to analyze market moves and sends a Gotify notification
-    ONLY if the summary has changed significantly or total portfolio moved > 0.5%.
+    ONLY if the summary has changed significantly or total portfolio moved > 0.5%
+    or individual stock crossed the threshold.
     """
-    global last_sent_summary
+    global last_notified_prices, last_total_change
     
     settings = get_settings(session)
     if not settings or not settings.groq_api_key or not settings.gotify_enabled:
         return
 
-    # Calculate Total Portfolio Value and Weighted Change
+    # 1. Calculate Total Portfolio Change
     total_val = 0.0
     total_change_val = 0.0
     
@@ -112,14 +115,63 @@ def analyze_and_notify(session, assets):
             
     total_change_pct = (total_change_val / (total_val - total_change_val)) * 100 if (total_val - total_change_val) > 0 else 0.0
     
-    print(f"Total Portfolio Change: {total_change_pct:.2f}%")
-    THRESHOLD = 0.5
+    # 2. Check Thresholds
+    threshold = settings.notification_threshold or 5.0
     
-    if abs(total_change_pct) < THRESHOLD:
-        significant_movers = [a for a in assets if a.daily_change_pct is not None and abs(a.daily_change_pct) > 2.0]
-        if not significant_movers:
-             return
+    print(f"Memory Check: Currently tracking {len(last_notified_prices)} movers. Total Change Ref: {last_total_change}")
+    if last_notified_prices:
+        print(f"Last Notified: { {t: round(p, 2) for t, p in last_notified_prices.items()} }")
+
+    # Identify current significant movers
+    current_significant_movers = [a for a in assets if a.daily_change_pct is not None and abs(a.daily_change_pct) >= threshold]
     
+    # Decide if we should notify
+    should_notify = False
+    assets_to_notify_about = []
+    
+    # Check 1: Individual Stock Logic
+    # Clean up memory: Remove stocks that have calmed down (below threshold)
+    current_tickers = set(a.ticker for a in current_significant_movers)
+    tickers_to_remove = [t for t in last_notified_prices if t not in current_tickers]
+    for t in tickers_to_remove:
+        del last_notified_prices[t]
+        
+    for asset in current_significant_movers:
+        ticker = asset.ticker
+        current_pct = asset.daily_change_pct
+        last_pct = last_notified_prices.get(ticker)
+        
+        if last_pct is None:
+            # Case A: New significant mover
+            print(f"Trigger: New mover {asset.name} ({current_pct:.2f}%)")
+            should_notify = True
+            assets_to_notify_about.append(asset)
+            last_notified_prices[ticker] = current_pct
+        else:
+            # Case B: Already notified, check for re-notify threshold (fixed at 5% deviance)
+            # You requested: "if there is a change to that + or - 5 to the previous one"
+            if abs(current_pct - last_pct) >= 5.0:
+                print(f"Trigger: Re-notify {asset.name} (Prev: {last_pct:.2f}%, Curr: {current_pct:.2f}%)")
+                should_notify = True
+                assets_to_notify_about.append(asset)
+                last_notified_prices[ticker] = current_pct
+            else:
+                pass # Ignored: Fluctuation is within 5% of last alert
+
+    # Check 2: Global Portfolio Logic
+    # Notify if total portfolio moves > 1% AND changes by at least 0.5% from last alert
+    current_total_state = round(total_change_pct, 2)
+    if abs(total_change_pct) >= 1.0:
+        if last_total_change is None or abs(current_total_state - last_total_change) >= 0.5:
+            should_notify = True
+            print(f"Trigger: Portfolio moved {total_change_pct:.2f}% (Prev: {last_total_change})")
+            last_total_change = current_total_state
+
+    if not should_notify:
+        print("Skipping notification: No new significant movements.")
+        return
+
+    # 3. Generate AI Summary
     sorted_assets = sorted([a for a in assets if a.daily_change_pct is not None], key=lambda x: x.daily_change_pct, reverse=True)
     top_gainers = sorted_assets[:5]
     top_losers = sorted_assets[-5:]
@@ -145,13 +197,13 @@ def analyze_and_notify(session, assets):
         )
         summary = completion.choices[0].message.content.strip()
         
-        if summary == last_sent_summary:
-            print("Skipping notification: Summary is identical.")
-            return
+        # Add links to notification
+        full_message = f"{summary}\n\n"
+        full_message += "🔗 [Grafana Dashboard](https://grafana.rvitservices.uk/d/c1e8e5e5-3e4b-4f67-9d7c-6d8b4e7e9b9c/finance-portfolio-overview?orgId=1&from=now-30d&to=now&timezone=browser&refresh=auto)\n"
+        full_message += "🏠 [Web UI](http://172.23.177.144:8502/)"
             
-        send_gotify_alert("📉 Market Update", summary, settings)
+        send_gotify_alert("📉 Market Update", full_message, settings)
         print(f"Sent AI Notification: {summary}")
-        last_sent_summary = summary
     except Exception as e:
         print(f"AI Analysis Failed: {e}")
 
@@ -181,23 +233,44 @@ def update_prices():
             if not asset.ticker or not asset.ticker.strip(): continue
             try:
                 ticker = yf.Ticker(asset.ticker)
-                # Fetch 35 days of history to ensure we get a valid 30-day prior price
-                hist = ticker.history(period="35d")
-                if hist.empty: continue
                 
-                today_price = hist['Close'].iloc[-1]
-                prev_close_price = hist['Close'].iloc[-2] if len(hist) >= 2 else today_price
+                # --- 1. Get Current Price (Robust) ---
+                today_price = None
+                prev_close_price = None
+                currency = 'INR' # Default
 
-                # Find price from 30 days ago
-                price_30d = None
-                target_date = datetime.date.today() - datetime.timedelta(days=30)
-                # Find the closest available date in history
-                closest_date = min(hist.index, key=lambda d: abs(d.date() - target_date))
-                price_30d = hist.loc[closest_date]['Close']
+                # Try getting fast history first (like app.py)
+                try:
+                    hist_short = ticker.history(period="5d")
+                    if not hist_short.empty:
+                        today_price = hist_short['Close'].iloc[-1]
+                        if len(hist_short) >= 2:
+                            prev_close_price = hist_short['Close'].iloc[-2]
+                except Exception as e:
+                    print(f"Short history failed for {asset.ticker}: {e}")
 
-                currency = ticker.info.get('currency', 'INR')
-                
-                # --- Currency Conversion ---
+                # Fallback to info if history fails
+                if today_price is None:
+                    try:
+                        info = ticker.info
+                        today_price = info.get('currentPrice') or info.get('regularMarketPrice')
+                        prev_close_price = info.get('previousClose') or info.get('regularMarketPreviousClose')
+                        currency = info.get('currency', 'INR')
+                    except Exception as e:
+                        print(f"Info fallback failed for {asset.ticker}: {e}")
+
+                if today_price is None:
+                    print(f"Skipping {asset.ticker}: No price found.")
+                    continue
+
+                # --- 2. Update Asset Price ---
+                # Attempt to get currency from history metadata if not set
+                if currency == 'INR':
+                    try:
+                        currency = ticker.fast_info.get('currency', 'INR')
+                    except: pass
+
+                # Currency Conversion
                 native_price = today_price
                 price_inr = native_price
                 
@@ -210,10 +283,23 @@ def update_prices():
                 asset.original_unit_price = native_price
                 asset.original_currency = currency
                 asset.last_updated = datetime.datetime.now()
-                asset.price_30d = price_30d
                 
-                if prev_close_price > 0:
+                if prev_close_price and prev_close_price > 0:
                     asset.daily_change_pct = ((today_price - prev_close_price) / prev_close_price) * 100
+
+                # --- 3. Get 30d History (Best Effort) ---
+                try:
+                    hist_long = ticker.history(period="40d")
+                    if not hist_long.empty:
+                        target_date = datetime.date.today() - datetime.timedelta(days=30)
+                        # Find closest date
+                        closest_date = min(hist_long.index, key=lambda d: abs(d.date() - target_date))
+                        # Only use if reasonably close (within 5 days)
+                        if abs((closest_date.date() - target_date).days) < 5:
+                            asset.price_30d = hist_long.loc[closest_date]['Close']
+                except Exception as e:
+                    # Do not fail the update if 30d history fails
+                    print(f"30d history check failed for {asset.ticker}: {e}")
                 
                 updated_assets_for_ai.append(asset)
                 updated_count += 1

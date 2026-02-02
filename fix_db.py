@@ -41,7 +41,8 @@ def run_migration():
             ("groq_api_key", "VARCHAR"),
             ("ai_context_columns", "VARCHAR"),
             ("report_time", "VARCHAR DEFAULT '18:00'"),
-            ("last_run_date", "DATE")
+            ("last_run_date", "DATE"),
+            ("notification_threshold", "FLOAT DEFAULT 5.0")
         ]
         
         for col, type_ in updates:
